@@ -72,7 +72,7 @@ impl ClientData {
     ) -> ClientData {
         let client_data = ClientData { user_id: 1 };
         let user_response = web_client.get_user(client_data.user_id).await;
-        send_user_presence(web_client.clone(), stream, user_response.user_id).await;
+        send_user_presence(web_client.clone(), stream, user_response.id).await;
         send_stats_update_with_response(web_client.clone(), &user_response, stream).await;
         client_data
     }
@@ -105,11 +105,11 @@ async fn send_stats_update_with_response(
     user_response: &web::User,
     stream: &mut tokio::net::TcpStream,
 ) {
-    let rank = web_client.get_rank(user_response.user_id).await;
+    let rank = web_client.get_rank(user_response.id).await;
     println!("Sending stats {:?}. Rank: {}", user_response, rank);
     stream
         .write_object(OsuUpdate {
-            user_id: user_response.user_id,
+            user_id: user_response.id,
             status_update: StatusUpdate {
                 status: 0,
                 status_text: "I am gaming".to_owned(),

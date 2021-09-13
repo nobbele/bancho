@@ -45,7 +45,7 @@ impl Client {
 #[derive(Debug, serde::Deserialize)]
 pub struct User {
     pub username: String,
-    pub user_id: i32,
+    pub id: i32,
     pub profile_image: Option<String>,
 
     pub total_score: i64,
