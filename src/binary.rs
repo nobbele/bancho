@@ -9,7 +9,9 @@ pub trait WriteToBinaryStream {
 
 #[async_trait]
 pub trait StreamExt {
+    async fn read_length_string(&mut self) -> String;
     async fn read_length_i32_array(&mut self) -> Vec<i32>;
+
     async fn write_length_string(&mut self, s: &str);
     async fn write_object<B: WriteToBinaryStream + Send + Sync>(&mut self, b: B);
 }
@@ -25,6 +27,18 @@ impl StreamExt for tokio::net::TcpStream {
         }
         v
     }
+
+    async fn read_length_string(&mut self) -> String {
+        let is_null = self.read_u8().await.unwrap();
+        if is_null == 0 {
+            panic!("Null string?");
+        }
+        let len = self.read_u8().await.unwrap();
+        let mut buf = vec![0; len as usize];
+        self.read_exact(&mut buf).await.unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
     async fn write_length_string(&mut self, s: &str) {
         self.write_u8(1).await.unwrap(); // Not Null?
         let len = s.len();

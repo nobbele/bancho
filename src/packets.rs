@@ -197,3 +197,18 @@ impl WriteToBinaryStream for UserPresence {
         stream.write_i32_le(self.rank).await.unwrap();
     }
 }
+
+packet! {
+    RequestType::BanchoRestart.into(),
+    struct NotifyRestart {
+        retry_ms: i32
+    }
+}
+
+#[async_trait]
+impl WriteToBinaryStream for NotifyRestart {
+    async fn write_to(&self, stream: &mut tokio::net::TcpStream) {
+        stream.write_object(self.header()).await;
+        stream.write_i32_le(self.retry_ms).await.unwrap();
+    }
+}

@@ -5,11 +5,15 @@ use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::ops::Add;
 use std::ops::Sub;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
 use tokio::io::BufReader;
+use web::Credentials;
+use web::LoginError;
 
 pub mod binary;
 pub mod misc;
@@ -19,6 +23,11 @@ pub mod web;
 const PACKET_ATTEMPT_DELAY: Duration = Duration::from_millis(10);
 const PING_TIMEOUT: Duration = Duration::from_millis(48000);
 const PING_TIMEOUT_SLACK: Duration = Duration::from_millis(8000);
+
+enum InternalMessage {
+    Ping, // Used to check if a channel is alive
+    Stop,
+}
 
 // TODO maybe categorize into Bancho and Osu?
 #[derive(Debug, num_enum::TryFromPrimitive, num_enum::IntoPrimitive)]
@@ -52,29 +61,30 @@ enum RequestType {
     BanchoUserPresence = 83,
     /// Id: 85
     OsuUserStatsRequest = 85,
+    BanchoRestart = 86,
 }
 
+#[derive(Debug)]
 struct ClientData {
-    user_id: i32,
-}
-
-#[allow(dead_code)]
-struct Credentials {
     username: String,
-    password_hash: String,
+    user_id: i32,
 }
 
 impl ClientData {
     pub async fn login(
-        _credentials: Credentials,
+        credentials: Credentials,
         stream: &mut tokio::net::TcpStream,
         web_client: web::Client,
-    ) -> ClientData {
-        let client_data = ClientData { user_id: 1 };
+    ) -> Result<ClientData, LoginError> {
+        let user_id = web_client.login(&credentials).await?;
+        let client_data = ClientData {
+            user_id,
+            username: credentials.username,
+        };
         let user_response = web_client.get_user(client_data.user_id).await;
         send_user_presence(web_client.clone(), stream, user_response.id).await;
         send_stats_update_with_response(web_client.clone(), &user_response, stream).await;
-        client_data
+        Ok(client_data)
     }
 }
 
@@ -156,15 +166,7 @@ async fn initialize_client(stream: &mut tokio::net::TcpStream, client: web::Clie
     println!("Password Hash: {}", password_hash);
     println!("Client Data: {}", client_data);
 
-    let user_id = 1;
-
-    stream.write_object(LoginReply { user_id }).await;
-    stream
-        .write_object(ChannelJoinSuccess {
-            channel_name: "#osu".to_owned(),
-        })
-        .await;
-    let client_data = ClientData::login(
+    let login_result = ClientData::login(
         Credentials {
             username: username.to_string(),
             password_hash: password_hash.to_string(),
@@ -173,24 +175,49 @@ async fn initialize_client(stream: &mut tokio::net::TcpStream, client: web::Clie
         client.clone(),
     )
     .await;
-    send_user_presence(client.clone(), stream, 2).await;
-    stream
-        .write_object(SendMessage {
-            sending_client: "GamerDuck".to_owned(),
-            content: "Hello I am gamer".to_owned(),
-            channel: "#osu".to_owned(),
-        })
-        .await;
 
-    {
-        use tokio::io::AsyncWriteExt;
-        stream.flush().await.unwrap();
+    let login_reply = LoginReply {
+        user_id: login_result.as_ref().map(|c| c.user_id).unwrap_or(-1),
+    };
+    println!("Login Reply: {:?}", login_reply);
+    stream.write_object(login_reply).await;
+
+    if let Ok(client_data) = login_result {
+        stream
+            .write_object(ChannelJoinSuccess {
+                channel_name: "#osu".to_owned(),
+            })
+            .await;
+
+        send_user_presence(client.clone(), stream, 2).await;
+        stream
+            .write_object(SendMessage {
+                sending_client: "GamerDuck".to_owned(),
+                content: "Hello I am gamer".to_owned(),
+                channel: "#osu".to_owned(),
+            })
+            .await;
+
+        {
+            use tokio::io::AsyncWriteExt;
+            stream.flush().await.unwrap();
+        }
+
+        client_data
+    } else {
+        {
+            use tokio::io::AsyncWriteExt;
+            stream.flush().await.unwrap();
+        }
+        panic!("Unable to login, {:?}", login_result.unwrap_err());
     }
-
-    client_data
 }
 
-async fn handle_client(mut stream: tokio::net::TcpStream, client: web::Client) {
+async fn handle_client(
+    mut stream: tokio::net::TcpStream,
+    client: web::Client,
+    msg_rx: std::sync::mpsc::Receiver<InternalMessage>,
+) {
     println!("New Client! {:?}", stream.peer_addr());
 
     let client_data = initialize_client(&mut stream, client.clone()).await;
@@ -203,7 +230,6 @@ async fn handle_client(mut stream: tokio::net::TcpStream, client: web::Client) {
             let mut buf = [0; 2];
             loop {
                 let res = nonblock_unwrap(stream.try_read(&mut buf)).unwrap();
-                if res.is_none() {}
                 if let Some(n) = res {
                     if n == buf.len() {
                         break;
@@ -211,18 +237,34 @@ async fn handle_client(mut stream: tokio::net::TcpStream, client: web::Client) {
                         println!("Client connection closed");
                         break 'outer;
                     }
-                } else {
-                    if time_diff(last_ping, last_pong) > PING_TIMEOUT.add(PING_TIMEOUT_SLACK) {
-                        println!("Client didn't respond to ping, assumed dead");
-                        break 'outer;
-                    }
-                    if last_ping.elapsed() > PING_TIMEOUT.sub(PING_TIMEOUT_SLACK) {
-                        println!("Ping!");
-                        stream.write_object(Ping {}).await;
-                        last_ping = Instant::now();
-                    }
-                    tokio::time::sleep(PACKET_ATTEMPT_DELAY).await;
                 }
+                if time_diff(last_ping, last_pong) > PING_TIMEOUT.add(PING_TIMEOUT_SLACK) {
+                    println!("Client didn't respond to ping, assumed dead");
+                    break 'outer;
+                }
+                if last_ping.elapsed() > PING_TIMEOUT.sub(PING_TIMEOUT_SLACK) {
+                    println!("Ping!");
+                    stream.write_object(Ping {}).await;
+                    last_ping = Instant::now();
+                }
+                let res = msg_rx.try_recv();
+                match res {
+                    Ok(msg) => match msg {
+                        InternalMessage::Ping => {}
+                        InternalMessage::Stop => {
+                            println!("Received a stop message");
+                            stream.write_object(NotifyRestart { retry_ms: 8000 }).await;
+                            break 'outer;
+                        }
+                    },
+                    Err(e) => match e {
+                        std::sync::mpsc::TryRecvError::Empty => {}
+                        std::sync::mpsc::TryRecvError::Disconnected => {
+                            panic!("Internal Message Channel was disconnected!")
+                        }
+                    },
+                }
+                tokio::time::sleep(PACKET_ATTEMPT_DELAY).await;
             }
             RequestType::try_from(u16::from_le_bytes(buf))
         } {
@@ -236,6 +278,12 @@ async fn handle_client(mut stream: tokio::net::TcpStream, client: web::Client) {
 
         use RequestType::*;
         match read_type {
+            OsuSendIrcMessage => {
+                let _sending_client = stream.read_length_string().await;
+                let content = stream.read_length_string().await;
+                let channel = stream.read_length_string().await;
+                println!("{} said '{}' in {}", client_data.username, content, channel);
+            }
             OsuExit => {
                 println!("Client Exited!");
                 break 'outer;
@@ -270,14 +318,39 @@ async fn handle_client(mut stream: tokio::net::TcpStream, client: web::Client) {
             }
         }
     }
+
+    println!("Goodbye!");
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:13382").await?;
+    let listener = tokio::net::TcpListener::bind("192.168.0.108:13382").await?;
+    println!("Running");
     let client = web::Client::new(reqwest::Client::builder().build()?);
+    let msg_txs: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<InternalMessage>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    ctrlc::set_handler({
+        let msg_txs = msg_txs.clone();
+        move || {
+            println!("Sending stop message, please wait..");
+            let msg_txs = msg_txs.lock().unwrap();
+            for msg_tx in msg_txs.iter() {
+                msg_tx.send(InternalMessage::Stop).unwrap();
+                // Wait for disconnect
+                while msg_tx.send(InternalMessage::Ping).is_ok() {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            println!("Sent stop message, exiting..");
+            std::process::exit(0);
+        }
+    })
+    .unwrap();
     loop {
         let (stream, _addr) = listener.accept().await?;
-        tokio::spawn(handle_client(stream, client.clone()));
+        let (msg_tx, msg_rx) = std::sync::mpsc::sync_channel(0);
+        let mut msg_txs = msg_txs.lock().unwrap();
+        msg_txs.push(msg_tx);
+        tokio::spawn(handle_client(stream, client.clone(), msg_rx));
     }
 }
