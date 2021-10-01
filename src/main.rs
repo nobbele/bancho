@@ -6,11 +6,12 @@ use std::fmt::Debug;
 use std::ops::Add;
 use std::ops::Sub;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::RwLock;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use web::Credentials;
 use web::LoginError;
@@ -51,6 +52,8 @@ enum RequestType {
     BanchoSendMessage = 7,
     /// Id: 8
     BanchoPing = 8,
+    /// Id: 24
+    BanchoAnnounce = 24,
     /// Id: 64
     BanchoChannelJoinSuccess = 64,
     /// Id: 68
@@ -61,6 +64,7 @@ enum RequestType {
     BanchoUserPresence = 83,
     /// Id: 85
     OsuUserStatsRequest = 85,
+    /// Id: 86
     BanchoRestart = 86,
 }
 
@@ -198,17 +202,10 @@ async fn initialize_client(stream: &mut tokio::net::TcpStream, client: web::Clie
             })
             .await;
 
-        {
-            use tokio::io::AsyncWriteExt;
-            stream.flush().await.unwrap();
-        }
-
+        stream.flush().await.unwrap();
         client_data
     } else {
-        {
-            use tokio::io::AsyncWriteExt;
-            stream.flush().await.unwrap();
-        }
+        stream.flush().await.unwrap();
         panic!("Unable to login, {:?}", login_result.unwrap_err());
     }
 }
@@ -324,16 +321,19 @@ async fn handle_client(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // client
     let listener = tokio::net::TcpListener::bind("192.168.0.108:13382").await?;
+    // web
+    let web_listener = tokio::net::TcpListener::bind("127.0.0.1:13383").await?;
     println!("Running");
     let client = web::Client::new(reqwest::Client::builder().build()?);
-    let msg_txs: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<InternalMessage>>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let msg_txs: Arc<RwLock<Vec<std::sync::mpsc::SyncSender<InternalMessage>>>> =
+        Arc::new(RwLock::new(Vec::new()));
     ctrlc::set_handler({
         let msg_txs = msg_txs.clone();
         move || {
             println!("Sending stop message, please wait..");
-            let msg_txs = msg_txs.lock().unwrap();
+            let msg_txs = msg_txs.read().unwrap();
             for msg_tx in msg_txs.iter() {
                 msg_tx.send(InternalMessage::Stop).unwrap();
                 // Wait for disconnect
@@ -347,10 +347,26 @@ async fn main() -> anyhow::Result<()> {
     })
     .unwrap();
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let (msg_tx, msg_rx) = std::sync::mpsc::sync_channel(0);
-        let mut msg_txs = msg_txs.lock().unwrap();
-        msg_txs.push(msg_tx);
-        tokio::spawn(handle_client(stream, client.clone(), msg_rx));
+        tokio::select! {
+            res = listener.accept() => {
+                let (stream, _addr) = res?;
+                let (msg_tx, msg_rx) = std::sync::mpsc::sync_channel(0);
+                let mut msg_txs = msg_txs.write().unwrap();
+                msg_txs.push(msg_tx);
+                tokio::spawn(handle_client(stream, client.clone(), msg_rx));
+            }
+            res = web_listener.accept() => {
+                let (mut stream, _addr) = res?;
+                let request_type = stream.read_u16_le().await.unwrap();
+                match request_type {
+                    // Get user count
+                    1 => {
+                        let msg_txs = msg_txs.read().unwrap();
+                        stream.write_u16_le(msg_txs.len() as u16).await.unwrap();
+                    }
+                    _ => panic!("Unknown request type from web")
+                }
+            }
+        };
     }
 }

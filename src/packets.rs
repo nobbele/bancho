@@ -212,3 +212,18 @@ impl WriteToBinaryStream for NotifyRestart {
         stream.write_i32_le(self.retry_ms).await.unwrap();
     }
 }
+
+packet! {
+    RequestType::BanchoAnnounce.into(),
+    struct Announce {
+        message: String
+    }
+}
+
+#[async_trait]
+impl WriteToBinaryStream for Announce {
+    async fn write_to(&self, stream: &mut tokio::net::TcpStream) {
+        stream.write_object(self.header()).await;
+        stream.write_length_string(&self.message).await;
+    }
+}
