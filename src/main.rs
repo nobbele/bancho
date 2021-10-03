@@ -366,7 +366,7 @@ async fn main() -> anyhow::Result<()> {
     // client
     let listener = tokio::net::TcpListener::bind("0.0.0.0:13382").await?;
     // web
-    let web_listener = tokio::net::TcpListener::bind("127.0.0.1:13383").await?;
+    let web_listener = tokio::net::TcpListener::bind("0.0.0.0:13383").await?;
     println!("Running");
     let client = web::Client::new(reqwest::Client::builder().build()?);
     let msg_txs: Arc<RwLock<Vec<std::sync::mpsc::SyncSender<InternalBanchoMessage>>>> =
