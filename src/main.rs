@@ -25,9 +25,24 @@ const PACKET_ATTEMPT_DELAY: Duration = Duration::from_millis(10);
 const PING_TIMEOUT: Duration = Duration::from_millis(48000);
 const PING_TIMEOUT_SLACK: Duration = Duration::from_millis(8000);
 
-enum InternalMessage {
+#[derive(Debug)]
+enum InternalBanchoMessage {
     Ping, // Used to check if a channel is alive
     Stop,
+    NewIrcMessage {
+        author: String,
+        message: String,
+        channel: String,
+    },
+}
+
+#[derive(Debug)]
+enum InternalClientMessage {
+    NewIrcMessage {
+        author: String,
+        message: String,
+        channel: String,
+    },
 }
 
 // TODO maybe categorize into Bancho and Osu?
@@ -213,7 +228,8 @@ async fn initialize_client(stream: &mut tokio::net::TcpStream, client: web::Clie
 async fn handle_client(
     mut stream: tokio::net::TcpStream,
     client: web::Client,
-    msg_rx: std::sync::mpsc::Receiver<InternalMessage>,
+    msg_rx: std::sync::mpsc::Receiver<InternalBanchoMessage>,
+    bancho_tx: tokio::sync::mpsc::Sender<InternalClientMessage>,
 ) {
     println!("New Client! {:?}", stream.peer_addr());
 
@@ -247,11 +263,30 @@ async fn handle_client(
                 let res = msg_rx.try_recv();
                 match res {
                     Ok(msg) => match msg {
-                        InternalMessage::Ping => {}
-                        InternalMessage::Stop => {
+                        InternalBanchoMessage::Ping => {}
+                        InternalBanchoMessage::Stop => {
                             println!("Received a stop message");
                             stream.write_object(NotifyRestart { retry_ms: 8000 }).await;
                             break 'outer;
+                        }
+                        InternalBanchoMessage::NewIrcMessage {
+                            author,
+                            message,
+                            channel,
+                        } => {
+                            if author != client_data.username {
+                                println!(
+                                    "Sending message '{}' in {} by {} to {}",
+                                    message, channel, author, client_data.username
+                                );
+                                stream
+                                    .write_object(SendMessage {
+                                        sending_client: author,
+                                        content: message,
+                                        channel,
+                                    })
+                                    .await;
+                            }
                         }
                     },
                     Err(e) => match e {
@@ -271,7 +306,7 @@ async fn handle_client(
 
         let _unused_byte = stream.read_u8().await.unwrap();
         let packet_length = stream.read_u32_le().await.unwrap();
-        println!("Received a {:?} packet", read_type);
+        println!("{}: {:?}", client_data.username, read_type);
 
         use RequestType::*;
         match read_type {
@@ -279,7 +314,14 @@ async fn handle_client(
                 let _sending_client = stream.read_length_string().await;
                 let content = stream.read_length_string().await;
                 let channel = stream.read_length_string().await;
-                println!("{} said '{}' in {}", client_data.username, content, channel);
+                bancho_tx
+                    .send(InternalClientMessage::NewIrcMessage {
+                        author: client_data.username.clone(),
+                        message: content,
+                        channel,
+                    })
+                    .await
+                    .unwrap();
             }
             OsuExit => {
                 println!("Client Exited!");
@@ -322,23 +364,35 @@ async fn handle_client(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // client
-    let listener = tokio::net::TcpListener::bind("192.168.0.108:13382").await?;
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:13382").await?;
     // web
     let web_listener = tokio::net::TcpListener::bind("127.0.0.1:13383").await?;
     println!("Running");
     let client = web::Client::new(reqwest::Client::builder().build()?);
-    let msg_txs: Arc<RwLock<Vec<std::sync::mpsc::SyncSender<InternalMessage>>>> =
+    let msg_txs: Arc<RwLock<Vec<std::sync::mpsc::SyncSender<InternalBanchoMessage>>>> =
         Arc::new(RwLock::new(Vec::new()));
+
+    let (bancho_tx, mut bancho_rx) = tokio::sync::mpsc::channel::<InternalClientMessage>(1);
     ctrlc::set_handler({
         let msg_txs = msg_txs.clone();
         move || {
             println!("Sending stop message, please wait..");
             let msg_txs = msg_txs.read().unwrap();
             for msg_tx in msg_txs.iter() {
-                msg_tx.send(InternalMessage::Stop).unwrap();
+                let _ = msg_tx.send(InternalBanchoMessage::Stop);
+
+                const MAX_ATTEMPT: u32 = 100;
+                let mut attempt = 0;
                 // Wait for disconnect
-                while msg_tx.send(InternalMessage::Ping).is_ok() {
+                while msg_tx.send(InternalBanchoMessage::Ping).is_ok() && attempt < MAX_ATTEMPT {
                     std::thread::sleep(Duration::from_millis(50));
+                    attempt += 1;
+                    if attempt % 10 == 0 && attempt != 0 {
+                        println!("Attempt {}", attempt);
+                    }
+                }
+                if attempt >= MAX_ATTEMPT {
+                    println!("Client thread refused to stop");
                 }
             }
             println!("Sent stop message, exiting..");
@@ -350,10 +404,12 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             res = listener.accept() => {
                 let (stream, _addr) = res?;
+
                 let (msg_tx, msg_rx) = std::sync::mpsc::sync_channel(0);
                 let mut msg_txs = msg_txs.write().unwrap();
                 msg_txs.push(msg_tx);
-                tokio::spawn(handle_client(stream, client.clone(), msg_rx));
+
+                tokio::spawn(handle_client(stream, client.clone(), msg_rx, bancho_tx.clone()));
             }
             res = web_listener.accept() => {
                 let (mut stream, _addr) = res?;
@@ -365,6 +421,21 @@ async fn main() -> anyhow::Result<()> {
                         stream.write_u16_le(msg_txs.len() as u16).await.unwrap();
                     }
                     _ => panic!("Unknown request type from web")
+                }
+            }
+            res = bancho_rx.recv() => {
+                let res = res.unwrap();
+                match res {
+                    InternalClientMessage::NewIrcMessage { author, message, channel } => {
+                        let msg_txs = msg_txs.read().unwrap();
+                        for msg_tx in msg_txs.iter() {
+                            msg_tx.send(InternalBanchoMessage::NewIrcMessage {
+                                author: author.clone(),
+                                message: message.clone(),
+                                channel: channel.clone()
+                            }).unwrap();
+                        }
+                    },
                 }
             }
         };
