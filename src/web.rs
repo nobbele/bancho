@@ -25,20 +25,22 @@ pub enum LoginError {
 
 #[derive(Clone)]
 pub struct Client {
+    api_host: String,
     client: reqwest::Client,
 }
 
 impl Client {
     pub fn new(client: reqwest::Client) -> Self {
-        Client { client }
+        let api_host = std::env::var("API_HOST").expect("No API_HOST in environment or .env");
+        Client { client, api_host }
     }
 
     pub async fn login(&self, credentials: &Credentials) -> Result<i32, LoginError> {
         let resp = self
             .client
             .get(format!(
-                "http://localhost/api/login?u={}&p={}",
-                credentials.username, credentials.password_hash
+                "{}/api/login?u={}&p={}",
+                self.api_host, credentials.username, credentials.password_hash
             ))
             .send()
             .await
@@ -56,7 +58,7 @@ impl Client {
 
     pub async fn get_user(&self, user_id: i32) -> User {
         self.client
-            .get(format!("http://localhost/api/user/{}/info", user_id))
+            .get(format!("{}/api/user/{}/info", self.api_host, user_id))
             .send()
             .await
             .unwrap()
@@ -67,7 +69,7 @@ impl Client {
 
     pub async fn get_rank(&self, user_id: i32) -> i32 {
         self.client
-            .get(format!("http://localhost/api/user/{}/rank", user_id))
+            .get(format!("{}/api/user/{}/rank", self.api_host, user_id))
             .send()
             .await
             .unwrap()
@@ -78,7 +80,7 @@ impl Client {
 
     pub async fn get_username(&self, user_id: i32) -> String {
         self.client
-            .get(format!("http://localhost/api/user/{}/username", user_id))
+            .get(format!("{}/api/user/{}/username", self.api_host, user_id))
             .send()
             .await
             .unwrap()

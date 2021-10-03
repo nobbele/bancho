@@ -363,6 +363,7 @@ async fn handle_client(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenv::dotenv()?;
     // client
     let listener = tokio::net::TcpListener::bind("0.0.0.0:13382").await?;
     // web
