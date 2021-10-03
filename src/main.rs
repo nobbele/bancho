@@ -34,6 +34,9 @@ enum InternalBanchoMessage {
         message: String,
         channel: String,
     },
+    NewPresence {
+        user_id: i32,
+    },
 }
 
 #[derive(Debug)]
@@ -42,6 +45,9 @@ enum InternalClientMessage {
         author: String,
         message: String,
         channel: String,
+    },
+    NewPresence {
+        user_id: i32,
     },
 }
 
@@ -201,26 +207,11 @@ async fn initialize_client(stream: &mut tokio::net::TcpStream, client: web::Clie
     println!("Login Reply: {:?}", login_reply);
     stream.write_object(login_reply).await;
 
+    stream.flush().await.unwrap();
+
     if let Ok(client_data) = login_result {
-        stream
-            .write_object(ChannelJoinSuccess {
-                channel_name: "#osu".to_owned(),
-            })
-            .await;
-
-        send_user_presence(client.clone(), stream, 2).await;
-        stream
-            .write_object(SendMessage {
-                sending_client: "GamerDuck".to_owned(),
-                content: "Hello I am gamer".to_owned(),
-                channel: "#osu".to_owned(),
-            })
-            .await;
-
-        stream.flush().await.unwrap();
         client_data
     } else {
-        stream.flush().await.unwrap();
         panic!("Unable to login, {:?}", login_result.unwrap_err());
     }
 }
@@ -234,6 +225,27 @@ async fn handle_client(
     println!("New Client! {:?}", stream.peer_addr());
 
     let client_data = initialize_client(&mut stream, client.clone()).await;
+
+    stream
+        .write_object(ChannelJoinSuccess {
+            channel_name: "#osu".to_owned(),
+        })
+        .await;
+
+    bancho_tx
+        .send(InternalClientMessage::NewPresence {
+            user_id: client_data.user_id,
+        })
+        .await
+        .unwrap();
+
+    stream
+        .write_object(SendMessage {
+            sending_client: "ClassicBancho".to_owned(),
+            content: "Welcome to osu!classic.".to_owned(),
+            channel: "#osu".to_owned(),
+        })
+        .await;
 
     let mut last_ping = Instant::now();
     let mut last_pong = Instant::now();
@@ -287,6 +299,9 @@ async fn handle_client(
                                     })
                                     .await;
                             }
+                        }
+                        InternalBanchoMessage::NewPresence { user_id } => {
+                            send_user_presence(client.clone(), &mut stream, user_id).await;
                         }
                     },
                     Err(e) => match e {
@@ -434,9 +449,17 @@ async fn main() -> anyhow::Result<()> {
                                 author: author.clone(),
                                 message: message.clone(),
                                 channel: channel.clone()
-                            }).unwrap();
+                            }).ok();
                         }
                     },
+                    InternalClientMessage::NewPresence { user_id } => {
+                        let msg_txs = msg_txs.read().unwrap();
+                        for msg_tx in msg_txs.iter() {
+                            msg_tx.send(InternalBanchoMessage::NewPresence {
+                                user_id
+                            }).ok();
+                        }
+                    }
                 }
             }
         };
