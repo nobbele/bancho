@@ -48,6 +48,7 @@ impl Client {
             .text()
             .await
             .unwrap();
+        println!("Got login response {}", resp);
         match resp.as_str() {
             "invalid username" => Err(LoginError::InvalidUsername),
             "invalid password" => Err(LoginError::InvalidPassword),

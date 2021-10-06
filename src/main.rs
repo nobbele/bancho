@@ -395,7 +395,9 @@ async fn main() -> anyhow::Result<()> {
             println!("Sending stop message, please wait..");
             let msg_txs = msg_txs.read().unwrap();
             for msg_tx in msg_txs.iter() {
+                println!("Sending stop message to client");
                 let _ = msg_tx.send(InternalBanchoMessage::Stop);
+                println!("Sent stop message to client");
 
                 const MAX_ATTEMPT: u32 = 100;
                 let mut attempt = 0;
