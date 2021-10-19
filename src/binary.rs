@@ -33,6 +33,7 @@ impl StreamExt for tokio::net::TcpStream {
         if is_null == 0 {
             panic!("Null string?");
         }
+        // Yes this ignores the 7-bit encoded integers.
         let len = self.read_u8().await.unwrap();
         let mut buf = vec![0; len as usize];
         self.read_exact(&mut buf).await.unwrap();
